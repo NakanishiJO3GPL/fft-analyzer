@@ -3,8 +3,8 @@
 
 use defmt_rtt as _; // global logger
 
-// Pull in the HAL so cortex-m-rt gets the device's vector table and memory layout.
-use stm32h7xx_hal as _;
+// Pull in embassy-stm32 so cortex-m-rt gets the device vector table/memory layout.
+use embassy_stm32 as _;
 
 use panic_probe as _;
 
