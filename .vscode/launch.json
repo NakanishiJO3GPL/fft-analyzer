@@ -21,11 +21,23 @@
                 {
                     "coreIndex": 0,
                     "programBinary": "./target/thumbv7em-none-eabihf/debug/${workspaceFolderBasename}",
-                    "rttEnabled": true
+                    "rttEnabled": true,
+                    "rttChannelFormats": [
+                        {
+                            "channelNumber": 0,
+                            "name": "defmt",
+                            "decoders": [
+                                { "type": "defmt", "metadataSource": "elf" }
+                            ]
+                        }
+                    ]
                 }
             ],
             "consoleLogLevel": "Debug",
             "wireProtocol": "Swd"
         }
-    ]
+    ],
+    "env": {
+        "DEFMT_LOG": "info"
+    }
 }
