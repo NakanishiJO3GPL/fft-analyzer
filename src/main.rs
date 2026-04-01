@@ -46,6 +46,10 @@ pub type UsbDriver = hal::usb::Driver<'static, hal::peripherals::USB_OTG_FS>;
 
 type Frame = [u32; HALF_DMA_BUFFER_SIZE];
 
+// DMA buffers for SAI RX/TX
+//   These are placed in SRAM1 to ensure they are in a memory region accessible by the DMA controller 
+//   and not affected by cache issues. 
+//   The size is set to accommodate ping-pong buffering for continuous audio streaming.
 #[unsafe(link_section = ".sram1")]
 static TX_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
 #[unsafe(link_section = ".sram1")]
@@ -54,11 +58,19 @@ static RX_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
 static mut FFT_BUFFER: GroundedArrayCell<Complex, BLOCK_SIZE> = GroundedArrayCell::uninit();
 
 // USB HID buffers and state
+//   These are placed in SRAM1 to ensure they are in a memory region accessible by the USB peripheral 
+//   and not affected by cache issues.
+#[unsafe(link_section = ".sram1")]
 static USB_EP_OUT_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_DEVICE_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_CTRL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_HID_STATE: StaticCell<HidState> = StaticCell::new();
 
 #[derive(Clone, Copy)]
@@ -80,10 +92,17 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    println!("--- Starting FFT Analyzer ---");
+    println!("--- Initialize SRAM1 ---");
     let tx_buffer = TX_BUFFER.init([0; DMA_BUFFER_SIZE]);
     let rx_buffer = RX_BUFFER.init([0; DMA_BUFFER_SIZE]);
+    let ep_out_buffer = USB_EP_OUT_BUF.init([0; 512]);
+    let device_descriptor = USB_DEVICE_DESC.init([0; 256]);
+    let config_descriptor = USB_CONFIG_DESC.init([0; 256]);
+    let bos_descriptor = USB_BOS_DESC.init([0; 256]);
+    let control_buf = USB_CTRL_BUF.init([0; 64]);
+    let hid_state = USB_HID_STATE.init(HidState::new());
 
+    println!("--- Starting FFT Analyzer ---");
     let mut config = hal::Config::default();
     {
         use hal::rcc::*;
@@ -187,8 +206,6 @@ async fn main(spawner: Spawner) {
     };
 
     // USB HID initialization
-    let ep_out_buffer = USB_EP_OUT_BUF.init([0; 512]);
-
     let mut usb_cfg = hal::usb::Config::default();
     usb_cfg.vbus_detection = false; 
 
@@ -208,11 +225,6 @@ async fn main(spawner: Spawner) {
     config.max_power = 500; // mA
     config.max_packet_size_0 = 64;
 
-    let device_descriptor = USB_DEVICE_DESC.init([0; 256]);
-    let config_descriptor = USB_CONFIG_DESC.init([0; 256]);
-    let bos_descriptor = USB_BOS_DESC.init([0; 256]);
-    let control_buf = USB_CTRL_BUF.init([0; 64]);
-
     let mut builder = Builder::new(
         hid_driver,
         config,
@@ -231,7 +243,6 @@ async fn main(spawner: Spawner) {
         hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::None,
     };
 
-    let hid_state = USB_HID_STATE.init(HidState::new());
     let hid = HidWriter::<UsbDriver, REPORT_SIZE>::new(&mut builder, hid_state, hid_config);
     let usb = builder.build();
 
@@ -242,13 +253,13 @@ async fn main(spawner: Spawner) {
     let sender = START_FFT_ANALYSIS.sender();
     let receiver = START_FFT_ANALYSIS.receiver();
 
+    spawner.spawn(unwrap!(usb_task(usb)));
+    spawner.spawn(unwrap!(hid_tx_task(hid)));
+
     spawner.spawn(unwrap!(pass_through_audio(sai_rx, sai_tx, sender)));
     
     spawner.spawn(unwrap!(analyze_fft(receiver)));
 
-    spawner.spawn(unwrap!(usb_task(usb)));
-
-    spawner.spawn(unwrap!(hid_tx_task(hid)));
 }
 
 
@@ -382,7 +393,12 @@ async fn hid_tx_task(mut hid: HidWriter<'static, UsbDriver, REPORT_SIZE>) {
             report[base..base + 2].copy_from_slice(&pkt.bins[i].to_le_bytes());
         }
 
-        let _ = hid.write(&report).await;
+        match hid.write(&report).await {
+			Ok(()) => {}
+			Err(e) => {
+				println!("HID write error: {:?}", e);
+			}
+		}
         Timer::after(Duration::from_millis(1)).await;
     }
 }   
