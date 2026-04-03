@@ -31,6 +31,7 @@ libm = "0.2"
 micromath = "2.1.0"
 static_cell = "2"
 grounded = "0.2"
+flip-link = "0.1.12"
 
 [dev-dependencies]
 defmt-test = "0.3"
