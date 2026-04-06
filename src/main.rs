@@ -26,10 +26,13 @@ use complex::Complex;
 const BLOCK_SIZE: usize = 512 * 4;
 const HALF_DMA_BUFFER_SIZE: usize = BLOCK_SIZE * 2; // 2ch
 const DMA_BUFFER_SIZE: usize = HALF_DMA_BUFFER_SIZE * 2; // 2 half blocks
+const FFT_AVE_BUFFER_SIZE: usize = BLOCK_SIZE / 2; // Only need half the bins (positive frequencies)
 
-const REPORT_SIZE: usize = 64;
-const BINS_PER_PACKET: usize = 30;
-const QUEUE_DEPTH: usize = 4;
+const REPORT_SIZE: usize = 256;
+const BINS_PER_PACKET: usize = 252;     // 2 bytes for seq, 2 bytes for offset, rest for bins
+const QUEUE_DEPTH: usize = 8;
+const SEND_FREQUENCY: u16 = 30;
+
 const HID_REPORT_DESC: &[u8] = &[
     0x06, 0x00, 0xff, // Usage Page (Vendor)
     0x09, 0x01,       // Usage (Vendor 1)
@@ -37,36 +40,49 @@ const HID_REPORT_DESC: &[u8] = &[
     0x15, 0x00,       //   Logical Min 0
     0x26, 0xff, 0x00, //   Logical Max 255
     0x75, 0x08,       //   Report Size 8
-    0x95, 0x40,       //   Report Count 64 bytes
+    0x96, 0x00, 0x01, //   Report Count 256 bytes (max for 8-bit count)
     0x09, 0x01,       //   Usage
     0x81, 0x02,       //   Input (Data,Var,Abs)
     0xc0,             // End Collection
 ];
 pub type UsbDriver = hal::usb::Driver<'static, hal::peripherals::USB_OTG_FS>;
 
+#[derive(Clone, Copy)]
+pub struct SpectrumPacket {
+    pub seq: u16,
+    pub offset: u16,
+    pub bins: [u8; BINS_PER_PACKET],
+}
+
 type Frame = [u32; HALF_DMA_BUFFER_SIZE];
 
+// DMA buffers for SAI RX/TX
+//   These are placed in SRAM1 to ensure they are in a memory region accessible by the DMA controller
+//   and not affected by cache issues.
+//   The size is set to accommodate ping-pong buffering for continuous audio streaming.
 #[unsafe(link_section = ".sram1")]
 static TX_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
 #[unsafe(link_section = ".sram1")]
 static RX_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
 
 static mut FFT_BUFFER: GroundedArrayCell<Complex, BLOCK_SIZE> = GroundedArrayCell::uninit();
+static mut FFT_AVE_BUFFER: GroundedArrayCell<f32, FFT_AVE_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
 // USB HID buffers and state
+//   These are placed in SRAM1 to ensure they are in a memory region accessible by the USB peripheral
+//   and not affected by cache issues.
+#[unsafe(link_section = ".sram1")]
 static USB_EP_OUT_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_DEVICE_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_CTRL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+#[unsafe(link_section = ".sram1")]
 static USB_HID_STATE: StaticCell<HidState> = StaticCell::new();
-
-#[derive(Clone, Copy)]
-pub struct SpectrumPacket {
-    pub seq: u16,
-    pub offset: u16,
-    pub bins: [u16; BINS_PER_PACKET],
-}
 
 // Channel
 static START_FFT_ANALYSIS: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
@@ -80,10 +96,17 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    println!("--- Starting FFT Analyzer ---");
+    println!("--- Initialize SRAM1 ---");
     let tx_buffer = TX_BUFFER.init([0; DMA_BUFFER_SIZE]);
     let rx_buffer = RX_BUFFER.init([0; DMA_BUFFER_SIZE]);
+    let ep_out_buffer = USB_EP_OUT_BUF.init([0; 512]);
+    let device_descriptor = USB_DEVICE_DESC.init([0; 256]);
+    let config_descriptor = USB_CONFIG_DESC.init([0; 256]);
+    let bos_descriptor = USB_BOS_DESC.init([0; 256]);
+    let control_buf = USB_CTRL_BUF.init([0; 64]);
+    let hid_state = USB_HID_STATE.init(HidState::new());
 
+    println!("--- Starting FFT Analyzer ---");
     let mut config = hal::Config::default();
     {
         use hal::rcc::*;
@@ -184,11 +207,11 @@ async fn main(spawner: Spawner) {
     unsafe {
         let buf = &mut *core::ptr::addr_of_mut!(FFT_BUFFER);
         buf.initialize_all_copied(Complex::new(0.0, 0.0));
+        let ave_buf = &mut *core::ptr::addr_of_mut!(FFT_AVE_BUFFER);
+        ave_buf.initialize_all_copied(0.0);
     };
 
     // USB HID initialization
-    let ep_out_buffer = USB_EP_OUT_BUF.init([0; 512]);
-
     let mut usb_cfg = hal::usb::Config::default();
     usb_cfg.vbus_detection = false;
 
@@ -208,11 +231,6 @@ async fn main(spawner: Spawner) {
     config.max_power = 500; // mA
     config.max_packet_size_0 = 64;
 
-    let device_descriptor = USB_DEVICE_DESC.init([0; 256]);
-    let config_descriptor = USB_CONFIG_DESC.init([0; 256]);
-    let bos_descriptor = USB_BOS_DESC.init([0; 256]);
-    let control_buf = USB_CTRL_BUF.init([0; 64]);
-
     let mut builder = Builder::new(
         hid_driver,
         config,
@@ -231,7 +249,6 @@ async fn main(spawner: Spawner) {
         hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::None,
     };
 
-    let hid_state = USB_HID_STATE.init(HidState::new());
     let hid = HidWriter::<UsbDriver, REPORT_SIZE>::new(&mut builder, hid_state, hid_config);
     let usb = builder.build();
 
@@ -242,13 +259,11 @@ async fn main(spawner: Spawner) {
     let sender = START_FFT_ANALYSIS.sender();
     let receiver = START_FFT_ANALYSIS.receiver();
 
+    spawner.spawn(unwrap!(usb_task(usb)));
+    spawner.spawn(unwrap!(hid_tx_task(hid)));
     spawner.spawn(unwrap!(pass_through_audio(sai_rx, sai_tx, sender)));
-
     spawner.spawn(unwrap!(analyze_fft(receiver)));
 
-    spawner.spawn(unwrap!(usb_task(usb)));
-
-    spawner.spawn(unwrap!(hid_tx_task(hid)));
 }
 
 
@@ -294,38 +309,17 @@ async fn pass_through_audio(
     }
 }
 
-fn enqueue_spectrum(seq: u16, spectrum: &[Complex]) -> Result<(), TrySendError<SpectrumPacket>> {
-    let mut offset = 0u16;
-    println!("Enqueueing spectrum packet: seq={}, len={}", seq, spectrum.len());
-    while (offset as usize) < spectrum.len() {
-        let mut pkt = SpectrumPacket {
-            seq,
-            offset,
-            bins: [0; BINS_PER_PACKET],
-        };
-
-        let take = min(BINS_PER_PACKET, spectrum.len() - offset as usize);
-        for i in 0..take {
-            pkt.bins[i] = quantize(spectrum[offset as usize + i].norm());
-        }
-
-        SEND_SPECTRUM.try_send(pkt)?;
-        offset += BINS_PER_PACKET as u16;
-    }
-    Ok(())
-}
-
-fn quantize(v: f32) -> u16 {
-    let scaled = (v * 32767.0).clamp(0.0, 65535.0);
-    scaled as u16
-}
-
 #[embassy_executor::task]
 async fn analyze_fft(
     receiver: Receiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
     let fft_buffer: &mut [Complex] = unsafe {
         let buf = &mut *core::ptr::addr_of_mut!(FFT_BUFFER);
+        let (ptr, len) = buf.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+    let fft_ave_buffer: &mut [f32] = unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(FFT_AVE_BUFFER);
         let (ptr, len) = buf.get_ptr_len();
         core::slice::from_raw_parts_mut(ptr, len)
     };
@@ -341,25 +335,40 @@ async fn analyze_fft(
         fft.process(fft_buffer);
 
         let spectrum = &fft_buffer[..(BLOCK_SIZE / 2)];
-        let _ = enqueue_spectrum(seq, spectrum);
+        for i in 0..spectrum.len() {
+            // Simple moving average with alpha = 0.5
+            fft_ave_buffer[i] = 0.5 * fft_ave_buffer[i] + 0.5 * spectrum[i].norm();
+        }
+        if seq % SEND_FREQUENCY == 0 {
+            let _ = enqueue_spectrum(seq / SEND_FREQUENCY, fft_ave_buffer);
+        }
         seq = seq.wrapping_add(1);
-        /*
-        let (max_idx, max_lvl) = spectrum.iter().enumerate().fold(
-            (0usize, f32::MIN),
-            |(i_a, a), (i_b, &b)| {
-                if b.norm() > a {
-                    (i_b, b.norm())
-                } else {
-                    (i_a, a)
-                }
-            },
-        );
-
-        let max_hz = (max_idx as f32) * (SAMPLE_RATE as f32) / (BLOCK_SIZE as f32);
-        let now = Instant::now().as_millis() as u64;
-        println!("{} : fft peak: {} Hz (norm {})", now, max_hz, max_lvl);
-        */
     }
+}
+
+fn enqueue_spectrum(seq: u16, spectrum: &[f32]) -> Result<(), TrySendError<SpectrumPacket>> {
+    let mut offset = 0u16;
+    while (offset as usize) < spectrum.len() {
+        let mut pkt = SpectrumPacket {
+            seq,
+            offset,
+            bins: [0; BINS_PER_PACKET],
+        };
+
+        let take = min(BINS_PER_PACKET, spectrum.len() - offset as usize);
+        for i in 0..take {
+            pkt.bins[i] = quantize(spectrum[offset as usize + i]);
+        }
+
+        SEND_SPECTRUM.try_send(pkt)?;
+        offset += BINS_PER_PACKET as u16;
+    }
+    Ok(())
+}
+
+fn quantize(v: f32) -> u8 {
+    let scaled = (v * 64.0).clamp(0.0, 255.0);
+    scaled as u8
 }
 
 
@@ -367,7 +376,6 @@ async fn analyze_fft(
 async fn usb_task(mut usb: UsbDevice<'static, UsbDriver>) {
     usb.run().await;
 }
-
 
 
 #[embassy_executor::task]
@@ -378,11 +386,16 @@ async fn hid_tx_task(mut hid: HidWriter<'static, UsbDriver, REPORT_SIZE>) {
         report[0..2].copy_from_slice(&pkt.seq.to_le_bytes());
         report[2..4].copy_from_slice(&pkt.offset.to_le_bytes());
         for i in 0..BINS_PER_PACKET {
-            let base = 4 + i * 2;
-            report[base..base + 2].copy_from_slice(&pkt.bins[i].to_le_bytes());
+            let base = 4 + i;
+            report[base] = pkt.bins[i];
         }
 
-        let _ = hid.write(&report).await;
+        match hid.write(&report).await {
+			Ok(()) => {}
+			Err(e) => {
+				println!("HID write error: {:?}", e);
+			}
+		}
         Timer::after(Duration::from_millis(1)).await;
     }
 }

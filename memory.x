@@ -30,7 +30,7 @@ SECTIONS {
         . = ALIGN(8);
     } > AXISRAM
 
-    .sram1 (NOLOAD) : ALIGN(4) {
+    .sram1 : ALIGN(4) {
         *(.sram1 .sram1.*);
         . = ALIGN(4);
     } > SRAM1
