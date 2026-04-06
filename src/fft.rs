@@ -223,6 +223,8 @@ impl Fft {
 //------------------------------
 #[cfg(test)]
 mod tests {
+    use defmt::println;
+    use micromath::F32Ext;
     use super::*;
 
     #[test]
@@ -261,5 +263,3 @@ mod tests {
     }
 
 }
-
-

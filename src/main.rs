@@ -95,11 +95,11 @@ async fn main(spawner: Spawner) {
         config.rcc.csi = true;
         config.rcc.pll1 = Some(Pll {
             source: PllSource::HSE,     // HSE : 8MHz
-            prediv: PllPreDiv::DIV2,    // PLL prediv: 8MHz / 2 = 4MHz   
+            prediv: PllPreDiv::DIV2,    // PLL prediv: 8MHz / 2 = 4MHz
             mul: PllMul::MUL192,        // PLL mul: 4MHz * 192 = 768MHz
             divp: Some(PllDiv::DIV2),   // PLL div for P clock (SYSCLK): 768MHz / 2 = 384MHz
             divq: Some(PllDiv::DIV16),  // PLL div for Q clock (USB)   : 768MHz / 16 = 48MHz
-            divr: Some(PllDiv::DIV2),   // PLL div for R clock 
+            divr: Some(PllDiv::DIV2),   // PLL div for R clock
         });
 
         // PLL3 is used for I2S clock generation.
@@ -190,7 +190,7 @@ async fn main(spawner: Spawner) {
     let ep_out_buffer = USB_EP_OUT_BUF.init([0; 512]);
 
     let mut usb_cfg = hal::usb::Config::default();
-    usb_cfg.vbus_detection = false; 
+    usb_cfg.vbus_detection = false;
 
     let hid_driver = hal::usb::Driver::new_fs(
         peri.USB_OTG_FS,
@@ -243,7 +243,7 @@ async fn main(spawner: Spawner) {
     let receiver = START_FFT_ANALYSIS.receiver();
 
     spawner.spawn(unwrap!(pass_through_audio(sai_rx, sai_tx, sender)));
-    
+
     spawner.spawn(unwrap!(analyze_fft(receiver)));
 
     spawner.spawn(unwrap!(usb_task(usb)));
@@ -255,7 +255,7 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn pass_through_audio(
-    mut sai_rx: sai::Sai<'static, hal::peripherals::SAI2, u32>, 
+    mut sai_rx: sai::Sai<'static, hal::peripherals::SAI2, u32>,
     mut sai_tx: sai::Sai<'static, hal::peripherals::SAI1, u32>,
     sender: Sender<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
@@ -278,12 +278,12 @@ async fn pass_through_audio(
                 continue;
             }
         }
-        
+
         if let Err(e) = sai_tx.write(&buf).await {
             warn!("SAI TX error: {:?}", e);
             continue;
         }
-        
+
         for i in 0..BLOCK_SIZE {
             let left_sample = (((buf[i * 2] as i32) << 9) >> 9) as f32 / (1 << 23) as f32;
             fft_buffer[i] = Complex::new(left_sample, 0.0);
@@ -373,7 +373,7 @@ async fn usb_task(mut usb: UsbDevice<'static, UsbDriver>) {
 #[embassy_executor::task]
 async fn hid_tx_task(mut hid: HidWriter<'static, UsbDriver, REPORT_SIZE>) {
     let mut report = [0u8; REPORT_SIZE];
-    loop {        
+    loop {
         let pkt = SEND_SPECTRUM.receive().await;
         report[0..2].copy_from_slice(&pkt.seq.to_le_bytes());
         report[2..4].copy_from_slice(&pkt.offset.to_le_bytes());
@@ -385,4 +385,4 @@ async fn hid_tx_task(mut hid: HidWriter<'static, UsbDriver, REPORT_SIZE>) {
         let _ = hid.write(&report).await;
         Timer::after(Duration::from_millis(1)).await;
     }
-}   
+}

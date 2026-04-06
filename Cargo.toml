@@ -4,12 +4,13 @@ name = "fft-analyzer"
 edition = "2024"
 version = "0.1.0"
 
-[lib]
-harness = false
+[[bin]]
+name = "fft-analyzer"
+path = "src/main.rs"
+test = false
+bench = false
 
-# needed for each integration test
-[[test]]
-name = "integration"
+[lib]
 harness = false
 
 [dependencies]
