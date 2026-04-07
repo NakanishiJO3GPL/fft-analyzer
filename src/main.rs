@@ -2,7 +2,6 @@
 #![no_std]
 
 use fft_analyzer as _; // global logger + panicking-behavior + memory layout
-use core::cmp::min;
 use defmt::*;
 use embassy_stm32 as hal;
 use hal::{bind_interrupts, time::*, sai::{self, *}, dma, usb};
@@ -11,9 +10,8 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     channel::{Channel, Sender, Receiver, TrySendError},
 };
-use embassy_usb::class::hid::{Config as HidConfig, HidWriter, State as HidState};
 use embassy_usb::{Builder, UsbDevice};
-use embassy_time::{Duration, Timer};
+use embassy_usb::driver::{Endpoint as _, EndpointIn as _, EndpointError};
 use static_cell::StaticCell;
 use grounded::uninit::GroundedArrayCell;
 
@@ -28,29 +26,18 @@ const HALF_DMA_BUFFER_SIZE: usize = BLOCK_SIZE * 2; // 2ch
 const DMA_BUFFER_SIZE: usize = HALF_DMA_BUFFER_SIZE * 2; // 2 half blocks
 const FFT_AVE_BUFFER_SIZE: usize = BLOCK_SIZE / 2; // Only need half the bins (positive frequencies)
 
-const REPORT_SIZE: usize = 256;
-const BINS_PER_PACKET: usize = 252;     // 2 bytes for seq, 2 bytes for offset, rest for bins
+const PACKET_SIZE: usize = 1026;
+const BULK_CHUNK: usize = 64;           // FS Bulk max packet size
+const BINS_PER_PACKET: usize = 1024;    // 2 bytes for seq and rest for bins
 const QUEUE_DEPTH: usize = 8;
-const SEND_FREQUENCY: u16 = 30;
+const SEND_FREQUENCY: u16 = 15;
 
-const HID_REPORT_DESC: &[u8] = &[
-    0x06, 0x00, 0xff, // Usage Page (Vendor)
-    0x09, 0x01,       // Usage (Vendor 1)
-    0xa1, 0x01,       // Collection (Application)
-    0x15, 0x00,       //   Logical Min 0
-    0x26, 0xff, 0x00, //   Logical Max 255
-    0x75, 0x08,       //   Report Size 8
-    0x96, 0x00, 0x01, //   Report Count 256 bytes (max for 8-bit count)
-    0x09, 0x01,       //   Usage
-    0x81, 0x02,       //   Input (Data,Var,Abs)
-    0xc0,             // End Collection
-];
 pub type UsbDriver = hal::usb::Driver<'static, hal::peripherals::USB_OTG_FS>;
+type BulkIn = <UsbDriver as embassy_usb::driver::Driver<'static>>::EndpointIn;
 
 #[derive(Clone, Copy)]
 pub struct SpectrumPacket {
     pub seq: u16,
-    pub offset: u16,
     pub bins: [u8; BINS_PER_PACKET],
 }
 
@@ -68,7 +55,7 @@ static RX_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
 static mut FFT_BUFFER: GroundedArrayCell<Complex, BLOCK_SIZE> = GroundedArrayCell::uninit();
 static mut FFT_AVE_BUFFER: GroundedArrayCell<f32, FFT_AVE_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
-// USB HID buffers and state
+// USB Bulk buffers
 //   These are placed in SRAM1 to ensure they are in a memory region accessible by the USB peripheral
 //   and not affected by cache issues.
 #[unsafe(link_section = ".sram1")]
@@ -81,8 +68,6 @@ static USB_CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 static USB_BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 #[unsafe(link_section = ".sram1")]
 static USB_CTRL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-#[unsafe(link_section = ".sram1")]
-static USB_HID_STATE: StaticCell<HidState> = StaticCell::new();
 
 // Channel
 static START_FFT_ANALYSIS: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
@@ -104,7 +89,6 @@ async fn main(spawner: Spawner) {
     let config_descriptor = USB_CONFIG_DESC.init([0; 256]);
     let bos_descriptor = USB_BOS_DESC.init([0; 256]);
     let control_buf = USB_CTRL_BUF.init([0; 64]);
-    let hid_state = USB_HID_STATE.init(HidState::new());
 
     println!("--- Starting FFT Analyzer ---");
     let mut config = hal::Config::default();
@@ -170,8 +154,6 @@ async fn main(spawner: Spawner) {
     sai_tx_config.frame_sync_polarity = FrameSyncPolarity::ActiveHigh;
     sai_tx_config.fifo_threshold = FifoThreshold::Empty;
 
-    //let tx_buffer = TX_BUFFER.init([0; DMA_BUFFER_SIZE]);
-
     let (sai1_sub_block_tx, _sai1_sub_block_rx) = hal::sai::split_subblocks(peri.SAI1);
     let sai_tx = sai::Sai::new_asynchronous(
         sai1_sub_block_tx,  // SubBlock
@@ -188,8 +170,6 @@ async fn main(spawner: Spawner) {
     sai_rx_config.mode = Mode::Master;
     sai_rx_config.tx_rx = TxRx::Receiver;
     sai_rx_config.fifo_threshold = FifoThreshold::Half; // Start DMA transfer when FIFO is half full to allow ping-pong buffering
-
-    //let rx_buffer = RX_BUFFER.init([0; DMA_BUFFER_SIZE]);
 
     let (_sai2_sub_block_tx, sai2_sub_block_rx) = hal::sai::split_subblocks(peri.SAI2);
     let mut sai_rx = sai::Sai::new_asynchronous(
@@ -211,11 +191,11 @@ async fn main(spawner: Spawner) {
         ave_buf.initialize_all_copied(0.0);
     };
 
-    // USB HID initialization
+    // USB Bulk initialization
     let mut usb_cfg = hal::usb::Config::default();
     usb_cfg.vbus_detection = false;
 
-    let hid_driver = hal::usb::Driver::new_fs(
+    let usb_driver = hal::usb::Driver::new_fs(
         peri.USB_OTG_FS,
         Irqs,
         peri.PA12,
@@ -232,7 +212,7 @@ async fn main(spawner: Spawner) {
     config.max_packet_size_0 = 64;
 
     let mut builder = Builder::new(
-        hid_driver,
+        usb_driver,
         config,
         device_descriptor,
         config_descriptor,
@@ -240,16 +220,14 @@ async fn main(spawner: Spawner) {
         control_buf,
     );
 
-    let hid_config = HidConfig {
-        report_descriptor: HID_REPORT_DESC,
-        request_handler: None,
-        poll_ms: 1,
-        max_packet_size: 64,
-        hid_subclass: embassy_usb::class::hid::HidSubclass::No,
-        hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::None,
-    };
-
-    let hid = HidWriter::<UsbDriver, REPORT_SIZE>::new(&mut builder, hid_state, hid_config);
+    // Vendor Bulk IN endpoint (class=0xFF, subclass=0, protocol=0)
+    let mut function = builder.function(0xFF, 0, 0);
+    let mut interface = function.interface();
+    let mut alt = interface.alt_setting(0xFF, 0, 0, None);
+    let bulk_ep_in = alt.endpoint_bulk_in(None, 64);
+    drop(alt);
+    drop(interface);
+    drop(function);
     let usb = builder.build();
 
     // SAI start
@@ -260,13 +238,10 @@ async fn main(spawner: Spawner) {
     let receiver = START_FFT_ANALYSIS.receiver();
 
     spawner.spawn(unwrap!(usb_task(usb)));
-    spawner.spawn(unwrap!(hid_tx_task(hid)));
+    spawner.spawn(unwrap!(bulk_tx_task(bulk_ep_in)));
     spawner.spawn(unwrap!(pass_through_audio(sai_rx, sai_tx, sender)));
     spawner.spawn(unwrap!(analyze_fft(receiver)));
-
 }
-
-
 
 #[embassy_executor::task]
 async fn pass_through_audio(
@@ -300,8 +275,8 @@ async fn pass_through_audio(
         }
 
         for i in 0..BLOCK_SIZE {
-            let left_sample = (((buf[i * 2] as i32) << 9) >> 9) as f32 / (1 << 23) as f32;
-            fft_buffer[i] = Complex::new(left_sample, 0.0);
+            let sample = (((buf[i * 2] as i32) << 9) >> 9) as f32 / (1 << 23) as f32;
+            fft_buffer[i] = Complex::new(sample, 0.0);
         }
 
         sender.clear();
@@ -347,22 +322,16 @@ async fn analyze_fft(
 }
 
 fn enqueue_spectrum(seq: u16, spectrum: &[f32]) -> Result<(), TrySendError<SpectrumPacket>> {
-    let mut offset = 0u16;
-    while (offset as usize) < spectrum.len() {
-        let mut pkt = SpectrumPacket {
-            seq,
-            offset,
-            bins: [0; BINS_PER_PACKET],
-        };
+    let mut pkt = SpectrumPacket {
+        seq,
+        bins: [0; BINS_PER_PACKET],
+    };
 
-        let take = min(BINS_PER_PACKET, spectrum.len() - offset as usize);
-        for i in 0..take {
-            pkt.bins[i] = quantize(spectrum[offset as usize + i]);
-        }
-
-        SEND_SPECTRUM.try_send(pkt)?;
-        offset += BINS_PER_PACKET as u16;
+    for i in 0..BINS_PER_PACKET {
+        pkt.bins[i] = quantize(spectrum[i]);
     }
+
+    SEND_SPECTRUM.try_send(pkt)?;
     Ok(())
 }
 
@@ -371,31 +340,56 @@ fn quantize(v: f32) -> u8 {
     scaled as u8
 }
 
-
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice<'static, UsbDriver>) {
     usb.run().await;
 }
 
-
 #[embassy_executor::task]
-async fn hid_tx_task(mut hid: HidWriter<'static, UsbDriver, REPORT_SIZE>) {
-    let mut report = [0u8; REPORT_SIZE];
+async fn bulk_tx_task(mut ep_in: BulkIn) {
+    let mut buf = [0u8; PACKET_SIZE];
     loop {
-        let pkt = SEND_SPECTRUM.receive().await;
-        report[0..2].copy_from_slice(&pkt.seq.to_le_bytes());
-        report[2..4].copy_from_slice(&pkt.offset.to_le_bytes());
-        for i in 0..BINS_PER_PACKET {
-            let base = 4 + i;
-            report[base] = pkt.bins[i];
-        }
+        // Wait until the host connects and enables the endpoint
+        ep_in.wait_enabled().await;
+        println!("Bulk IN endpoint enabled");
 
-        match hid.write(&report).await {
-			Ok(()) => {}
-			Err(e) => {
-				println!("HID write error: {:?}", e);
-			}
-		}
-        Timer::after(Duration::from_millis(1)).await;
+        'connected: loop {
+            let pkt = SEND_SPECTRUM.receive().await;
+
+            // Assemble the packet: [seq(2)] [bins(252)]
+            buf[0..2].copy_from_slice(&pkt.seq.to_le_bytes());
+            for i in 0..BINS_PER_PACKET {
+                buf[2 + i] = pkt.bins[i];
+            }
+
+            // Send PACKET_SIZE bytes as (PACKET_SIZE / BULK_CHUNK) × 64-byte packets
+            for chunk in buf.chunks(BULK_CHUNK) {
+                match ep_in.write(chunk).await {
+                    Ok(()) => {}
+                    Err(EndpointError::Disabled) => {
+                        println!("Bulk IN disabled, waiting for reconnect");
+                        break 'connected;
+                    }
+                    Err(EndpointError::BufferOverflow) => {
+                        println!("Bulk IN buffer overflow");
+                        break 'connected;
+                    }
+                }
+            }
+
+            // Send a zero-length packet to signal end of transfer.
+            // Required because PACKET_SIZE (256) is an exact multiple of BULK_CHUNK (64).
+            match ep_in.write(&[]).await {
+                Ok(()) => {}
+                Err(EndpointError::Disabled) => {
+                    println!("Bulk IN disabled on ZLP, waiting for reconnect");
+                    break 'connected;
+                }
+                Err(EndpointError::BufferOverflow) => {
+                    println!("Bulk IN ZLP buffer overflow");
+                    break 'connected;
+                }
+            }
+        }
     }
 }
