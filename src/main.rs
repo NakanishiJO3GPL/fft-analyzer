@@ -14,6 +14,7 @@ use embassy_usb::{Builder, UsbDevice};
 use embassy_usb::driver::{Endpoint as _, EndpointIn as _, EndpointError};
 use static_cell::StaticCell;
 use grounded::uninit::GroundedArrayCell;
+use micromath::F32Ext;
 
 mod fft;
 mod complex;
@@ -307,11 +308,15 @@ async fn analyze_fft(
     loop {
         let _ = receiver.receive().await;
 
+        for k in 0..BLOCK_SIZE {
+            fft_buffer[k].re *= window_function(BLOCK_SIZE - 1, k);
+            fft_buffer[k].im = 0.0;
+        }
+
         fft.process(fft_buffer);
 
         let spectrum = &fft_buffer[..(BLOCK_SIZE / 2)];
         for i in 0..spectrum.len() {
-            // Simple moving average with alpha = 0.5
             fft_ave_buffer[i] = 0.5 * fft_ave_buffer[i] + 0.5 * spectrum[i].norm();
         }
         if seq % SEND_FREQUENCY == 0 {
@@ -319,6 +324,11 @@ async fn analyze_fft(
         }
         seq = seq.wrapping_add(1);
     }
+}
+
+fn window_function(n: usize, k: usize) -> f32 {
+    // Hanning window
+    0.5 * (1.0 - (2.0 * core::f32::consts::PI * k as f32 / (n - 1) as f32).cos())
 }
 
 fn enqueue_spectrum(seq: u16, spectrum: &[f32]) -> Result<(), TrySendError<SpectrumPacket>> {
