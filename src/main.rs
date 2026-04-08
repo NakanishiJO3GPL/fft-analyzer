@@ -336,7 +336,7 @@ fn enqueue_spectrum(seq: u16, spectrum: &[f32]) -> Result<(), TrySendError<Spect
 }
 
 fn quantize(v: f32) -> u8 {
-    let scaled = (v * 64.0).clamp(0.0, 255.0);
+    let scaled = (v * 16.0).clamp(0.0, 255.0);
     scaled as u8
 }
 
